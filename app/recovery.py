@@ -10,7 +10,9 @@ Pipeline (exactly the three ARIES phases):
 3. Undo      — loser transactions (no commit record by crash time) are
    rolled back in reverse-LSN order along each transaction's prevLSN
    chain; a page is rewritten only when the page-LSN condition holds
-   (the page currently carries exactly the update being undone).
+   (the page currently carries the update being undone: pageLSN >= the
+   undone LSN).  A later committed update on a non-overlapping interval
+   of the same page advances the pageLSN but does not block the undo.
 
 Only record types begin/update/commit/abort/end/checkpoint are accepted.
 Every update carries its transaction predecessor (prevLSN), page number,
@@ -640,10 +642,11 @@ def recover(payload: dict[str, Any]) -> dict[str, Any]:
 
         st = current_page(rec.page)
         before_lsn = st.page_lsn
-        if st.page_lsn != rec.lsn:
+        if before_lsn is None or before_lsn < rec.lsn:
             raise RecoveryError(
                 f"撤销 LSN {rec.lsn}（事务 {rec.xid}，页 {rec.page}）时页 LSN 条件不满足："
-                f"当前 pageLSN={st.page_lsn}，期望 {rec.lsn}（只在条件满足时改写页像）"
+                f"当前 pageLSN={'无' if before_lsn is None else before_lsn}，"
+                f"需要 ≥ {rec.lsn}（该更新未体现在页像中，只在条件满足时改写页像）"
             )
         interval = bytes(st.data[rec.offset : rec.offset + rec.length])
         if interval != rec.after:
@@ -653,7 +656,15 @@ def recover(payload: dict[str, Any]) -> dict[str, Any]:
                 " —— 错误前像，稳定拒绝"
             )
         st.data[rec.offset : rec.offset + rec.length] = rec.before
-        st.page_lsn = rec.prev_lsn if rec.prev_lsn else None
+        if before_lsn == rec.lsn:
+            # Undoing the page's latest update: roll the pageLSN back
+            # along this transaction's prevLSN chain.
+            st.page_lsn = rec.prev_lsn if rec.prev_lsn else None
+            lsn_note = f"pageLSN {before_lsn}→{st.page_lsn}"
+        else:
+            # A later (committed) update is still present on the page:
+            # the pageLSN must not retreat along the loser's chain.
+            lsn_note = f"pageLSN 保持 {before_lsn}（页上仍有更晚更新，不回退）"
         undone += 1
         trace.append(
             {
@@ -663,12 +674,12 @@ def recover(payload: dict[str, Any]) -> dict[str, Any]:
                 "xid": rec.xid,
                 "page": rec.page,
                 "criterion": (
-                    f"撤销判据：pageLSN={before_lsn} == 撤销 LSN {rec.lsn} "
-                    "→ 页 LSN 条件满足，逆序沿 prevLSN 链回写 before"
+                    f"撤销判据：pageLSN={before_lsn} ≥ 撤销 LSN {rec.lsn} "
+                    "→ 页 LSN 条件满足（该更新确在页上），逆序沿 prevLSN 链回写 before"
                 ),
                 "decision": (
                     f"撤销 [{rec.offset},{rec.offset + rec.length})：after→before，"
-                    f"pageLSN {before_lsn}→{rec.prev_lsn}，下一跳 {rec.prev_lsn}"
+                    f"{lsn_note}，下一跳 {rec.prev_lsn}"
                 ),
                 "pageLSNBefore": before_lsn,
                 "pageLSNAfter": st.page_lsn,

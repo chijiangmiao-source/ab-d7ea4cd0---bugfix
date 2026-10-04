@@ -151,6 +151,64 @@ class LoserUndoTests(unittest.TestCase):
             run("undo-guard", pages, wal)
         self.assertIn("页 LSN 条件不满足", str(ctx.exception))
 
+    def test_interleaved_committed_update_does_not_block_loser_undo(self):
+        # T1 and T2 interleave non-overlapping writes on the same page:
+        #   T1 [0,4)  aaaaaaaa @20, T2 [4,8) bbbbbbbb @40, T1 [8,12) cccccccc @50.
+        # T1 commits and ends; T2 is still active at the crash (loser).
+        # After redo the pageLSN has advanced to T1's later committed
+        # update (50); undoing T2's earlier non-overlapping LSN-40 write
+        # must still succeed and must not disturb T1's committed bytes.
+        wal = [
+            begin(10, "T1"),
+            upd(20, "T1", 10, 1, 0, "00000000", "aaaaaaaa"),
+            begin(30, "T2"),
+            upd(40, "T2", 30, 1, 4, "00000000", "bbbbbbbb"),
+            upd(50, "T1", 20, 1, 8, "00000000", "cccccccc"),
+            commit(60, "T1", 50),
+            end(70, "T1", 60),
+        ]
+        v = run("interleaved-same-page", [page(1, ZEROS, page_lsn=10)], wal)
+
+        self.assertEqual(v["committedTransactions"], ["T1"])
+        self.assertEqual(v["loserTransactions"], ["T2"])
+        self.assertEqual(v["redone"], 3)
+        self.assertEqual(v["undone"], 1)
+
+        p1 = v["pages"][0]
+        data = p1["data"]
+        # T1's committed writes survive; only T2's interval is rolled back.
+        self.assertEqual(data[0:8], "aaaaaaaa")     # offset 0 kept
+        self.assertEqual(data[8:16], "00000000")    # offset 4 restored to before
+        self.assertEqual(data[16:24], "cccccccc")   # offset 8 kept
+        # pageLSN stays at T1's later committed update; it must not
+        # retreat along the loser's prevLSN chain.
+        self.assertEqual(p1["pageLSNBefore"], 10)
+        self.assertEqual(p1["pageLSNAfter"], 50)
+
+        undo_rows = [t for t in v["trace"] if t["phase"] == "undo" and t["type"] == "update"]
+        self.assertEqual(len(undo_rows), 1)
+        self.assertEqual(undo_rows[0]["lsn"], 40)
+        self.assertEqual(undo_rows[0]["pageLSNBefore"], 50)
+        self.assertEqual(undo_rows[0]["pageLSNAfter"], 50)
+
+    def test_overlapping_later_update_still_rejected_at_undo(self):
+        # Same interleaving, but T1's later committed update OVERLAPS T2's
+        # interval: T2's after-bytes no longer sit on the page, so the undo
+        # cannot restore the before-image without clobbering T1's committed
+        # bytes -> the relaxed page-LSN condition must still stably reject.
+        wal = [
+            begin(10, "T1"),
+            upd(20, "T1", 10, 1, 0, "00000000", "aaaaaaaa"),
+            begin(30, "T2"),
+            upd(40, "T2", 30, 1, 4, "00000000", "bbbbbbbb"),
+            upd(50, "T1", 20, 1, 4, "bbbbbbbb", "dddddddd"),  # overlaps T2
+            commit(60, "T1", 50),
+            end(70, "T1", 60),
+        ]
+        with self.assertRaises(RecoveryError) as ctx:
+            run("interleaved-overlap", [page(1, ZEROS, page_lsn=10)], wal)
+        self.assertIn("错误前像", str(ctx.exception))
+
     def test_aborted_without_end_is_also_rolled_back(self):
         wal = [
             begin(10, "T9"),

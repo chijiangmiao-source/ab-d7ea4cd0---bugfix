@@ -154,6 +154,38 @@ def run_checks(base: str, managed_proc, managed_tmp) -> int:
         check("loser bytes rolled back", p7["data"][32:40] == "00" * 4)
         check("committed T1 bytes remain", p7["data"].startswith("11" * 16))
 
+        # 6b. interleaved same-page updates: T1's later committed update
+        # (offset 8, LSN 50) advances the pageLSN past loser T2's earlier
+        # non-overlapping update (offset 4, LSN 40) — undo must still run,
+        # the valid history must NOT be answered with 422.
+        interleaved = {
+            "auditId": "SMOKE-INTERLEAVED",
+            "pages": [{"page": 1, "pageLSN": 10, "data": Z}],
+            "wal": [
+                {"lsn": 10, "type": "begin", "xid": "T1"},
+                {"lsn": 20, "type": "update", "xid": "T1", "prevLSN": 10,
+                 "page": 1, "offset": 0, "before": "00000000", "after": "aaaaaaaa"},
+                {"lsn": 30, "type": "begin", "xid": "T2"},
+                {"lsn": 40, "type": "update", "xid": "T2", "prevLSN": 30,
+                 "page": 1, "offset": 4, "before": "00000000", "after": "bbbbbbbb"},
+                {"lsn": 50, "type": "update", "xid": "T1", "prevLSN": 20,
+                 "page": 1, "offset": 8, "before": "00000000", "after": "cccccccc"},
+                {"lsn": 60, "type": "commit", "xid": "T1", "prevLSN": 50},
+                {"lsn": 70, "type": "end", "xid": "T1", "prevLSN": 60},
+            ],
+        }
+        status, payload = request("POST", f"{base}/api/recover", interleaved, expect=200)
+        v = payload["verdict"]
+        check("interleaved same-page history accepted (no 422)",
+              payload["status"] == "accepted")
+        check("interleaved loser T2 identified", v["loserTransactions"] == ["T2"])
+        check("interleaved loser update undone", v["undone"] == 1)
+        p1 = v["pages"][0]
+        check("T1 bytes at offset 0 kept", p1["data"][0:8] == "aaaaaaaa")
+        check("T2 bytes at offset 4 rolled back", p1["data"][8:16] == "00000000")
+        check("T1 bytes at offset 8 kept", p1["data"][16:24] == "cccccccc")
+        check("pageLSN kept at committed LSN 50", p1["pageLSNAfter"] == 50)
+
         # 7. corrupted predecessor chain -> stable rejection
         corrupted = json.loads(json.dumps(committed))
         corrupted["auditId"] = "SMOKE-REJECT"
