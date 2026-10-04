@@ -130,23 +130,26 @@ class LoserUndoTests(unittest.TestCase):
         # T1 committed bytes remain; T2 bytes are rolled back to before-image.
         self.assertTrue(p7["data"].startswith("11" * 16))
         self.assertTrue(p7["data"][32:40] == "00" * 4)
-        # Undo rolled pageLSN from 60 back along T2's prevLSN chain (35).
+        # T2's undo does not drag the page LSN onto T2's own chain: the
+        # newest update physically remaining on page 7 is T1's LSN30 (LSN35
+        # is T2's begin, which never modified the page).
         self.assertEqual(p7["pageLSNBefore"], 30)
-        self.assertEqual(p7["pageLSNAfter"], 35)
+        self.assertEqual(p7["pageLSNAfter"], 30)
 
         p9 = next(p for p in v["pages"] if p["page"] == 9)
         self.assertFalse(p9["changed"])  # LSN20 was already on the image
 
     def test_undo_requires_page_lsn_condition(self):
         # Crashed image *already contains* T2's after bytes but with an
-        # older pageLSN: redo is idempotently skipped, so at undo time
-        # pageLSN != 60 -> the page-LSN guard must reject the rewrite.
+        # older pageLSN: redo is idempotently skipped, so the update LSN
+        # is never recorded as present on the page -> undo must reject the
+        # rewrite rather than trusting bytes without an LSN guarantee.
         pages, wal = self.sample_loser_payload(page7_lsn=30)
         raw = bytearray.fromhex(pages[0]["data"])
         raw[16:20] = bytes.fromhex("22222222")
         pages[0]["data"] = bytes(raw).hex()
         # pageLSN still 30 while bytes equal after: redo skips (idempotent),
-        # undo finds pageLSN 30 != 60 -> stable rejection.
+        # undo finds LSN 60 not covered by the image -> stable rejection.
         with self.assertRaises(RecoveryError) as ctx:
             run("undo-guard", pages, wal)
         self.assertIn("页 LSN 条件不满足", str(ctx.exception))
@@ -209,6 +212,106 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(v["redone"], 1)
         self.assertEqual(v["undone"], 1)
         self.assertFalse(v["pages"][0]["changed"])
+
+
+class InterleavedSamePageTests(unittest.TestCase):
+    """Interleaved transactions updating the same page at disjoint offsets.
+
+    T1 writes offset 0, loser T2 writes offset 4, then T1 commits after a
+    later write at offset 8.  T1's later committed update owns the page's
+    pageLSN and must not block undoing T2's older, non-overlapping bytes.
+    """
+
+    def _wal(self):
+        return [
+            begin(10, "T1"),
+            upd(20, "T1", 10, 1, 0, "00000000", "aaaaaaaa"),
+            begin(30, "T2"),
+            upd(40, "T2", 30, 1, 4, "00000000", "bbbbbbbb"),
+            upd(50, "T1", 20, 1, 8, "00000000", "cccccccc"),
+            commit(60, "T1", 50),
+            end(70, "T1", 60),
+        ]
+
+    def _assert_final_page(self, v, redone, page_lsn_before):
+        self.assertEqual(v["committedTransactions"], ["T1"])
+        self.assertEqual(v["loserTransactions"], ["T2"])
+        self.assertEqual(v["redone"], redone)
+        self.assertEqual(v["undone"], 1)
+        p1 = next(p for p in v["pages"] if p["page"] == 1)
+        data = p1["data"]
+        # T1's committed bytes at byte offsets 0 and 8 survive; T2's bytes
+        # at offset 4 revert to zeros.  Each 4-byte group is 8 hex chars.
+        self.assertEqual(data[0:8], "aaaaaaaa")     # offset 0
+        self.assertEqual(data[8:16], "00" * 4)      # offset 4 (T2 undone)
+        self.assertEqual(data[16:24], "cccccccc")   # offset 8
+        self.assertEqual(data[24:32], "00" * 4)
+        self.assertEqual(p1["pageLSNBefore"], page_lsn_before)
+        # The page LSN stays owned by T1's latest surviving update (50);
+        # undo never rewinds it onto loser T2's prevLSN chain.
+        self.assertEqual(p1["pageLSNAfter"], 50)
+        undo_rows = [t for t in v["trace"]
+                     if t["phase"] == "undo" and t["type"] == "update"]
+        self.assertEqual([t["lsn"] for t in undo_rows], [40])
+
+    def test_later_committed_same_page_update_does_not_block_undo(self):
+        # Crashed image already contains every update (pageLSN 50): redo
+        # only skips, undo must still revert T2's offset-4 interval.
+        raw = bytearray(4096)
+        raw[0:4] = bytes.fromhex("aaaaaaaa")
+        raw[4:8] = bytes.fromhex("bbbbbbbb")
+        raw[8:12] = bytes.fromhex("cccccccc")
+        pages = [page(1, bytes(raw).hex(), page_lsn=50)]
+        v = run("interleave-on-disk", pages, self._wal())
+        self._assert_final_page(v, redone=0, page_lsn_before=50)
+
+    def test_interleaved_history_redone_then_partially_undone(self):
+        # Stale crashed image (pageLSN 10): repeat all history via redo,
+        # then undo just T2 — the same final bytes must result.
+        pages = [page(1, ZEROS, page_lsn=10)]
+        v = run("interleave-redo-undo", pages, self._wal())
+        self._assert_final_page(v, redone=3, page_lsn_before=10)
+
+    def test_two_losers_same_page_disjoint_intervals_both_undone(self):
+        raw = bytearray(4096)
+        raw[0:4] = bytes.fromhex("aaaaaaaa")
+        raw[4:8] = bytes.fromhex("bbbbbbbb")
+        wal = [
+            begin(10, "T1"),
+            upd(20, "T1", 10, 1, 0, "00000000", "aaaaaaaa"),
+            begin(30, "T2"),
+            upd(40, "T2", 30, 1, 4, "00000000", "bbbbbbbb"),
+            # neither transaction commits
+        ]
+        v = run("two-losers-one-page", [page(1, bytes(raw).hex(), page_lsn=40)], wal)
+        self.assertEqual(sorted(v["loserTransactions"]), ["T1", "T2"])
+        self.assertEqual(v["undone"], 2)
+        data = v["pages"][0]["data"]
+        self.assertEqual(data[0:16], "00" * 8)
+        # Reverse-LSN order across the shared page.
+        undo_rows = [t for t in v["trace"]
+                     if t["phase"] == "undo" and t["type"] == "update"]
+        self.assertEqual([t["lsn"] for t in undo_rows], [40, 20])
+        # No update of either loser survives on the page -> no page LSN.
+        self.assertIsNone(v["pages"][0]["pageLSNAfter"])
+
+    def test_committed_update_overlapping_loser_interval_still_rejected(self):
+        # T2 (loser) writes offset 0 at LSN40; T1 then commits a different
+        # value over the SAME interval at LSN50.  Undo must not blindly
+        # restore T2's before-image over T1's committed bytes.
+        raw = bytearray(4096)
+        raw[0:4] = bytes.fromhex("dddddddd")
+        wal = [
+            begin(10, "T1"),
+            begin(30, "T2"),
+            upd(40, "T2", 30, 1, 0, "00000000", "bbbbbbbb"),
+            upd(50, "T1", 10, 1, 0, "00000000", "dddddddd"),
+            commit(60, "T1", 50),
+            end(70, "T1", 60),
+        ]
+        with self.assertRaises(RecoveryError) as ctx:
+            run("overlap-committed", [page(1, bytes(raw).hex(), page_lsn=50)], wal)
+        self.assertIn("错误前像", str(ctx.exception))
 
 
 class StableRejectionTests(unittest.TestCase):

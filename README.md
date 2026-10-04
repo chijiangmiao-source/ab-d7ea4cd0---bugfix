@@ -4,7 +4,9 @@
 记录**（仅含 `begin/update/commit/abort/end/checkpoint`），服务严格执行 ARIES
 三阶段——**分析**（自检查点建立脏页表 DPT 与事务表 ATT）、**重做**（自最小
 recLSN，仅在 `pageLSN < LSN` 即确有缺失时重写）、**撤销**（失败事务沿
-prevLSN 前驱链逆序，且只在页 LSN 条件满足时回写 before）——并冻结恢复裁决与
+prevLSN 前驱链逆序；仅当该失败更新确在页上（崩溃页像 pageLSN 覆盖或经重做
+补写）且其区间仍为 after 镜像时回写 before——同页更晚的已提交更新只占据整页
+pageLSN，不阻断对未提交事务不重叠区间的撤销）——并冻结恢复裁决与
 最终页摘要（恢复前后 pageLSN、SHA-256）。
 
 断链、重复 LSN、错误前像、越界区间或已结束事务仍被引用时，一律 **HTTP 422

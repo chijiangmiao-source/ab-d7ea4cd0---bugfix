@@ -154,7 +154,54 @@ def run_checks(base: str, managed_proc, managed_tmp) -> int:
         check("loser bytes rolled back", p7["data"][32:40] == "00" * 4)
         check("committed T1 bytes remain", p7["data"].startswith("11" * 16))
 
-        # 7. corrupted predecessor chain -> stable rejection
+        # 7. interleaved transactions, same page, disjoint intervals:
+        # T1 commits a later update (pageLSN 50) while loser T2's earlier
+        # non-overlapping update must still be undone.  Must be accepted
+        # (regression: used to return 422 "页 LSN 条件不满足").
+        interleaved_page = bytearray(4096)
+        interleaved_page[0:4] = bytes.fromhex("aaaaaaaa")
+        interleaved_page[4:8] = bytes.fromhex("bbbbbbbb")
+        interleaved_page[8:12] = bytes.fromhex("cccccccc")
+        interleaved = {
+            "auditId": "SMOKE-INTERLEAVED",
+            "pages": [{"page": 1, "pageLSN": 50,
+                       "data": bytes(interleaved_page).hex()}],
+            "wal": [
+                {"lsn": 10, "type": "begin", "xid": "T1"},
+                {"lsn": 20, "type": "update", "xid": "T1", "prevLSN": 10,
+                 "page": 1, "offset": 0,
+                 "before": "00000000", "after": "aaaaaaaa"},
+                {"lsn": 30, "type": "begin", "xid": "T2"},
+                {"lsn": 40, "type": "update", "xid": "T2", "prevLSN": 30,
+                 "page": 1, "offset": 4,
+                 "before": "00000000", "after": "bbbbbbbb"},
+                {"lsn": 50, "type": "update", "xid": "T1", "prevLSN": 20,
+                 "page": 1, "offset": 8,
+                 "before": "00000000", "after": "cccccccc"},
+                {"lsn": 60, "type": "commit", "xid": "T1", "prevLSN": 50},
+                {"lsn": 70, "type": "end", "xid": "T1", "prevLSN": 60},
+            ],
+        }
+        status, payload = request("POST", f"{base}/api/recover", interleaved, expect=200)
+        v = payload.get("verdict", {})
+        final_hex = (v.get("pages") or [{}])[0].get("data", "")
+        check("interleaved history accepted (no 422)",
+              status == 200 and payload.get("status") == "accepted"
+              and v.get("loserTransactions") == ["T2"]
+              and v.get("committedTransactions") == ["T1"]
+              and v.get("undone") == 1,
+              detail=str(payload.get("error", "")))
+        check("interleaved final bytes: keep aaaa/cccc, undo bbbb",
+              final_hex[0:8] == "aaaaaaaa"
+              and final_hex[8:16] == "00" * 4
+              and final_hex[16:24] == "cccccccc"
+              and (v.get("pages") or [{}])[0].get("pageLSNAfter") == 50)
+        status, payload = request("GET",
+                                  f"{base}/api/audit?auditId=SMOKE-INTERLEAVED")
+        check("interleaved verdict frozen as accepted",
+              status == 200 and payload.get("status") == "accepted")
+
+        # 8. corrupted predecessor chain -> stable rejection
         corrupted = json.loads(json.dumps(committed))
         corrupted["auditId"] = "SMOKE-REJECT"
         corrupted["wal"][1]["prevLSN"] = 999
@@ -163,7 +210,7 @@ def run_checks(base: str, managed_proc, managed_tmp) -> int:
         status, payload = request("GET", f"{base}/api/audit?auditId=SMOKE-REJECT")
         check("rejection frozen as rejected", payload["status"] == "rejected")
 
-        # 8. rejection of same audit id CLEARS earlier success evidence
+        # 9. rejection of same audit id CLEARS earlier success evidence
         status, payload = request("POST", f"{base}/api/recover", committed, expect=200)
         check("baseline success stored", payload["status"] == "accepted")
         corrupted2 = json.loads(json.dumps(committed))
@@ -175,7 +222,7 @@ def run_checks(base: str, managed_proc, managed_tmp) -> int:
         check("old success evidence replaced by rejection",
               payload["status"] == "rejected" and "verdict" not in payload)
 
-        # 9. unknown audit id
+        # 10. unknown audit id
         status, _ = request("GET", f"{base}/api/audit?auditId=NOPE", expect=404)
         check("unknown auditId -> 404", status == 404)
 
